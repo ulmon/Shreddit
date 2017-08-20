@@ -1,7 +1,8 @@
-import arrow
 import argparse
+import arrow
 import json
 import logging
+import urllib2
 import os
 import praw
 import sys
@@ -11,17 +12,20 @@ from datetime import datetime, timedelta
 from praw.models import Comment, Submission
 from prawcore.exceptions import ResponseException, OAuthException, BadRequest
 from re import sub
-from shreddit.util import get_sentence, ShredditError
+from util import get_sentence, ShredditError
+import pdfkit
 
 
 class Shredder(object):
     """This class stores state for configuration, API objects, logging, etc. It exposes a shred() method that
     application code can call to start it.
     """
+
     def __init__(self, config, user):
         logging.basicConfig()
         self._logger = logging.getLogger("shreddit")
-        self._logger.setLevel(level=logging.DEBUG if config.get("verbose", True) else logging.INFO)
+        self._logger.setLevel(level=logging.DEBUG
+                              if config.get("verbose", True) else logging.INFO)
         self.__dict__.update({"_{}".format(k): config[k] for k in config})
 
         self._user = user
@@ -50,17 +54,23 @@ class Shredder(object):
             for subreddit in multireddit.subreddits:
                 self._blacklist.add(str(subreddit).lower())
 
-
-        self._logger.info("Deleting ALL items before {}".format(self._nuke_cutoff))
-        self._logger.info("Deleting items not whitelisted until {}".format(self._recent_cutoff))
-        self._logger.info("Ignoring ALL items after {}".format(self._recent_cutoff))
-        self._logger.info("Targeting {} sorted by {}".format(self._item, self._sort))
+        self._logger.info("Deleting ALL items before {}".format(
+            self._nuke_cutoff))
+        self._logger.info("Deleting items not whitelisted until {}".format(
+            self._recent_cutoff))
+        self._logger.info("Ignoring ALL items after {}".format(
+            self._recent_cutoff))
+        self._logger.info("Targeting {} sorted by {}".format(self._item,
+                                                             self._sort))
         if self._blacklist:
-            self._logger.info("Deleting ALL items from subreddits {}".format(", ".join(list(self._blacklist))))
+            self._logger.info("Deleting ALL items from subreddits {}".format(
+                ", ".join(list(self._blacklist))))
         if self._whitelist:
-            self._logger.info("Keeping items from subreddits {}".format(", ".join(list(self._whitelist))))
+            self._logger.info("Keeping items from subreddits {}".format(
+                ", ".join(list(self._whitelist))))
         if self._keep_a_copy and self._save_directory:
-            self._logger.info("Saving deleted items to: {}".format(self._save_directory))
+            self._logger.info("Saving deleted items to: {}".format(
+                self._save_directory))
         if self._trial_run:
             self._logger.info("Trial run - no deletion will be performed")
 
@@ -70,15 +80,20 @@ class Shredder(object):
         if deleted >= 1000:
             # This user has more than 1000 items to handle, which angers the gods of the Reddit API. So chill for a
             # while and do it again.
-            self._logger.info("Waiting {} seconds and continuing...".format(self._batch_cooldown))
+            self._logger.info("Waiting {} seconds and continuing...".format(
+                self._batch_cooldown))
             time.sleep(self._batch_cooldown)
             self._connect()
             self.shred()
 
     def _connect(self):
         try:
-            self._r = praw.Reddit(self._user, check_for_updates=False, user_agent="python:shreddit:v6.0.4")
-            self._logger.info("Logged in as {user}.".format(user=self._r.user.me()))
+            self._r = praw.Reddit(
+                self._user,
+                check_for_updates=False,
+                user_agent="python:shreddit:v6.0.4")
+            self._logger.info("Logged in as {user}.".format(
+                user=self._r.user.me()))
         except ResponseException:
             raise ShredditError("Bad OAuth credentials")
         except OAuthException:
@@ -87,7 +102,8 @@ class Shredder(object):
     def _check_whitelist(self, item):
         """Returns True if the item is whitelisted, False otherwise.
         """
-        if str(item.subreddit).lower() in self._whitelist or item.id in self._whitelist_ids:
+        if str(item.subreddit).lower(
+        ) in self._whitelist or item.id in self._whitelist_ids:
             return True
         if self._whitelist_distinguished and item.distinguished:
             return True
@@ -99,18 +115,51 @@ class Shredder(object):
 
     def _save_item(self, item):
         name = item.subreddit_name_prefixed[2:]
-        path = "{}/{}/{}.json".format(item.author, name, item.id)
-        if not os.path.exists(os.path.join(self._save_directory, os.path.dirname(path))):
-            os.makedirs(os.path.join(self._save_directory, os.path.dirname(path)))
+        # Path for the json metadata for the comment
+        path = "{}/{}/{}.json".format(item.author, name, str(datetime.fromtimestamp(item.created_utc)) + '_' +  item.id)
+        # Path for the pdf of the comment, that is, what comment permalink
+        # returns).
+        path_pdf = "{}/{}/{}.pdf".format(item.author, name, str(datetime.fromtimestamp(item.created_utc)) + '_' +  item.id)
+        # replace ':' with '-' for compatibility with windows.
+        path = path.replace(':', '-')
+        path_pdf = path_pdf.replace(':', '-')
+        if not os.path.exists(
+                os.path.join(self._save_directory, os.path.dirname(path))):
+            os.makedirs(
+                os.path.join(self._save_directory, os.path.dirname(path)))
         with open(os.path.join(self._save_directory, path), "w") as fh:
             # This is a temporary replacement for the old .json_dict property:
-            output = {k: item.__dict__[k] for k in item.__dict__ if not k.startswith("_")}
+            output = {k: item.__dict__[k]
+                      for k in item.__dict__ if not k.startswith("_")}
             output["subreddit"] = output["subreddit"].title
             output["author"] = output["author"].name
             json.dump(output, fh, indent=2)
 
+        if self._item == "comments":
+            # Save the webpage and context the comment was in as pdf. Get the
+            # permalink, then use pdfkit to render and download the webpage, saving
+            # to _save_directory/path_pdf
+            permalink = "https://www.reddit.com" +item.permalink() + "/?context=10000"
+            # Encode as utf8 as there are some permalinks that aren't in ascii it seems.
+            permalink =permalink.encode('utf-8')
+            self._logger.info("Permalink is: {}".format(permalink))
+            # This will except, but the pdf seems to render fine. Only continue if
+            # it is ProtocolInvalidOperationError, since this seems to be an
+            # exception that doesn't cause harm.
+            try:
+                pdfkit.from_url(permalink, os.path.join(self._save_directory,
+                                                    path_pdf))
+            except Exception as exception:
+                if 'Exit with code 1 due to network error: ProtocolInvalidOperationError' in exception.message:
+                    pass
+                else:
+                    self._logger.info("exception other than protocol invalid operation error")
+                    print exception.message
+                    exit(1)
+
     def _remove_submission(self, sub):
-        self._logger.info("Deleting submission: #{id} {url}".format(id=sub.id, url=sub.url.encode("utf-8")))
+        self._logger.info("Deleting submission: #{id} {url}".format(
+            id=sub.id, url=sub.url.encode("utf-8")))
 
     def _remove_comment(self, comment):
         if self._replacement_format == "random":
@@ -121,7 +170,8 @@ class Shredder(object):
             replacement_text = self._replacement_format
 
         short_text = sub(b"\n\r\t", " ", comment.body[:35].encode("utf-8"))
-        msg = "/r/{}/ #{} ({}) with: {}".format(comment.subreddit, comment.id, short_text, replacement_text)
+        msg = "/r/{}/ #{} ({}) with: {}".format(comment.subreddit, comment.id,
+                                                short_text, replacement_text)
 
         self._logger.debug("Editing and deleting {msg}".format(msg=msg))
         if not self._trial_run:
@@ -134,7 +184,8 @@ class Shredder(object):
             try:
                 item.clear_vote()
             except BadRequest:
-                self._logger.debug("Couldn't clear vote on {item}".format(item=item))
+                self._logger.debug("Couldn't clear vote on {item}".format(
+                    item=item))
         if isinstance(item, Submission):
             self._remove_submission(item)
         elif isinstance(item, Comment):
@@ -145,7 +196,8 @@ class Shredder(object):
     def _remove_things(self, items):
         self._logger.info("Loading items to delete...")
         to_delete = [item for item in items]
-        self._logger.info("Done. Starting on batch of {} items...".format(len(to_delete)))
+        self._logger.info("Done. Starting on batch of {} items...".format(
+            len(to_delete)))
         count, count_removed = 0, 0
         for item in to_delete:
             count += 1
@@ -186,4 +238,5 @@ class Shredder(object):
         elif self._sort == "controversial":
             return item.controversial(limit=None)
         else:
-            raise ShredditError("Sorting \"{}\" not recognized.".format(self._sort))
+            raise ShredditError("Sorting \"{}\" not recognized.".format(
+                self._sort))
