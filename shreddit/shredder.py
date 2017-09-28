@@ -135,6 +135,7 @@ class Shredder(object):
             output["author"] = output["author"].name
             json.dump(output, fh, indent=2)
 
+        # Currently, only support saving pdf render of comments.
         if self._item == "comments":
             # Save the webpage and context the comment was in as pdf. Get the
             # permalink, then use pdfkit to render and download the webpage, saving
